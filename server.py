@@ -7,10 +7,10 @@ text/image/audio/video in, text out) through the OpenCode Zen endpoints and
 returns the answer as plain text.
 
 Providers (same code path, OpenAI-compatible /chat/completions). Built in:
-* go    - https://opencode.ai/zen/go/v1  model mimo-v2.5       (opencode go, paid, 1M ctx)   DEFAULT
-* free  - https://opencode.ai/zen/v1     model mimo-v2.5-free  (opencode zen, free, 200k ctx)
+* mimo-v2.5 - opencode go       - https://opencode.ai/zen/go/v1  model mimo-v2.5       (opencode go, paid, 1M ctx)   DEFAULT
+* mimo-v2.5-free - opencode zen - https://opencode.ai/zen/v1     model mimo-v2.5-free  (opencode zen, free, 200k ctx)
 More can be added/removed and the default switched in the web UI
-(`server.py ui`, http://127.0.0.1:8938) or by editing the store file
+(the daemon's web UI, http://127.0.0.1:8938) or by editing the store file
 ~/.config/mcp-qmedia/providers.json (0600, outside the repo - it may hold keys).
 
 API key per provider - never stored in this repo. Resolution order:
@@ -36,7 +36,6 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -47,24 +46,24 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ---------------------------------------------------------------- config
 
 BUILTIN_PROVIDERS: dict[str, dict[str, str]] = {
-    "go": {
+    "mimo-v2.5 - opencode go": {
         "base": "https://opencode.ai/zen/go/v1",
         "model": "mimo-v2.5",
         "auth_entry": "opencode-go",
-        "note": "opencode go, paid ($0.14/M in), 1M ctx",
+        "note": "",
         "api_key": "",
     },
-    "free": {
+    "mimo-v2.5-free - opencode zen": {
         "base": "https://opencode.ai/zen/v1",
         "model": "mimo-v2.5-free",
         "auth_entry": "opencode",
-        "note": "opencode zen, free, 200k ctx",
+        "note": "",
         "api_key": "",
     },
 }
-BUILTIN_DEFAULT = "go"
+BUILTIN_DEFAULT = "mimo-v2.5 - opencode go"
 STORE = Path(os.environ.get("QMEDIA_STORE", "~/.config/mcp-qmedia/providers.json")).expanduser()
-UI_PORT = int(os.environ.get("QMEDIA_UI_PORT", "8938"))
+PORT = int(os.environ.get("QMEDIA_PORT", os.environ.get("QMEDIA_UI_PORT", "8938")))  # MCP SSE + web UI
 AUTH_JSON = Path(
     os.environ.get("QMEDIA_AUTH_JSON", "~/.local/share/opencode/auth.json")
 ).expanduser()
@@ -393,152 +392,35 @@ def _provider_rows() -> list[dict]:
 @mcp.tool()
 def backends() -> str:
     """List providers (endpoint, model, which is default, whether an API key resolves) and ffmpeg
-    availability. Never prints a key. Manage providers in the web UI (mcp-qmedia ui, :8938)."""
+    availability. Never prints a key. Manage providers in the web UI (http://127.0.0.1:8938/)."""
     lines = []
     for r in _provider_rows():
         mark = " (default)" if r["default"] else ""
         key = f"key: yes ({r['key_source']})" if r["key_ok"] else f"key: NO - {r['key_source']}"
-        lines.append(f"{r['name']}{mark}: {r['model']} @ {r['base']} - {r['note']}; {key}")
+        lines.append(f"{r['name']}{mark}: {r['model']} @ {r['base']}"
+                     + (f" - {r['note']}" if r['note'] else "") + f"; {key}")
     lines.append(f"ffmpeg: {FFMPEG or 'not found (large/odd formats cannot be transcoded)'}")
     lines.append(f"max bytes per file before transcoding: {MAX_BYTES}; timeout: {TIMEOUT:.0f}s")
     lines.append(f"provider store: {STORE}")
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------- web UI (server.py ui)
+# ---------------------------------------------------------------- daemon: MCP over SSE + web UI, one port
+# web/page.html at the repo root - the layout every daemon repo shares; /api/status follows
+# ai-agent-setup/web/STATUS.md (the hub on :8930 polls it).
 
-UI_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>qmedia · providers & probe</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; background: #14161a; color: #e8e8ea;
-         display: flex; height: 100vh; }
-  #side { width: 420px; border-right: 1px solid #26292f; padding: 12px; overflow: auto; }
-  #side h1 { font-size: 15px; margin: 0 0 10px; }
-  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: #8b90a0; margin: 14px 0 6px; }
-  #providers li { list-style: none; padding: 7px 8px; border-radius: 6px; background: #1c1f26; margin: 4px 0; }
-  #providers li.default { outline: 1px solid #4f7cff; }
-  #providers .name { font-weight: 600; }
-  #providers .meta { color: #8b90a0; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
-  #providers .key { font-size: 12px; }
-  #providers .key.ok { color: #4ade80; } #providers .key.bad { color: #f87171; }
-  #providers .row { display: flex; gap: 6px; margin-top: 5px; }
-  input, textarea, select { background: #1c1f26; border: 1px solid #2a2e37; color: #e8e8ea; border-radius: 8px; padding: 7px 10px; font: inherit; }
-  input:focus, textarea:focus, select:focus { outline: none; border-color: #4f7cff; }
-  button { background: #4f7cff; border: 0; color: #fff; border-radius: 8px; padding: 7px 12px; cursor: pointer; font: inherit; }
-  button.ghost { background: none; border: 1px solid #2a2e37; color: #8b90a0; }
-  button.danger { background: none; border: 1px solid #5b2a2a; color: #f87171; }
-  button:disabled { opacity: .5; cursor: default; }
-  form.stack { display: flex; flex-direction: column; gap: 6px; }
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 16px; gap: 10px; overflow: auto; }
-  #main textarea { width: 100%; }
-  #files { min-height: 64px; font-family: ui-monospace, monospace; font-size: 12px; }
-  #question { min-height: 56px; }
-  #probeRow { display: flex; gap: 8px; align-items: center; }
-  #answer { flex: 1; white-space: pre-wrap; word-break: break-word; background: #1c1f26; border-radius: 8px; padding: 12px; overflow: auto; font-size: 13px; }
-  #answer.err { color: #f87171; }
-  #answer .head { color: #8b90a0; font-family: ui-monospace, monospace; font-size: 12px; margin-bottom: 8px; }
-  #history { max-height: 30vh; overflow: auto; }
-  #history div { color: #8b90a0; font-size: 12px; padding: 3px 0; border-top: 1px solid #26292f; cursor: pointer; }
-  small { color: #8b90a0; }
-</style>
-</head>
-<body>
-<div id="side">
-  <h1>qmedia · providers <a href="http://127.0.0.1:8934/hub" style="font-weight:400;font-size:12px;color:#60a5fa;text-decoration:none">All daemons ↗</a></h1>
-  <ul id="providers"></ul>
-  <h2>Add / update provider</h2>
-  <form class="stack" id="addForm">
-    <input name="name" placeholder="name (e.g. go, free, openrouter)" required>
-    <input name="base" placeholder="base URL, e.g. https://opencode.ai/zen/go/v1" required>
-    <input name="model" placeholder="model, e.g. mimo-v2.5" required>
-    <input name="api_key" type="password" placeholder="API key (empty = env / opencode auth.json)">
-    <input name="auth_entry" placeholder="opencode auth.json entry to fall back to (e.g. opencode-go)">
-    <input name="note" placeholder="note">
-    <div class="row"><button type="submit">Save provider</button>
-      <label><input type="checkbox" name="make_default"> make default</label></div>
-  </form>
-  <h2>Info</h2>
-  <div id="info" class="meta" style="font-size:12px;color:#8b90a0;white-space:pre-wrap"></div>
-</div>
-<div id="main">
-  <h2>Probe</h2>
-  <textarea id="files" placeholder="one media source per line: http(s):// URL or local path (image / audio / video)"></textarea>
-  <textarea id="question" placeholder="question (empty = thorough describe)"></textarea>
-  <div id="probeRow">
-    <select id="provider"></select>
-    <button id="ask">Ask</button>
-    <small id="status"></small>
-  </div>
-  <div id="answer"><small>answers appear here · keys are never sent to the browser</small></div>
-  <h2>History (this page)</h2>
-  <div id="history"></div>
-</div>
-<script>
-const $ = s => document.querySelector(s);
-const api = (m, u, b) => fetch(u, {method: m, headers: {'content-type': 'application/json'}, body: b ? JSON.stringify(b) : undefined}).then(async r => { const t = await r.text(); let j; try { j = JSON.parse(t); } catch { j = {error: t}; } if (!r.ok) throw new Error(j.error || t); return j; });
-async function load() {
-  const d = await api('GET', '/api/providers');
-  const ul = $('#providers'); ul.innerHTML = '';
-  const sel = $('#provider'); const cur = sel.value; sel.innerHTML = '';
-  for (const p of d.providers) {
-    const li = document.createElement('li'); if (p.default) li.className = 'default';
-    li.innerHTML = `<div><span class="name">${p.name}</span> ${p.default ? '<small>· default</small>' : ''} ${p.builtin ? '<small>· built-in</small>' : ''}</div>
-      <div class="meta">${p.model} @ ${p.base}</div>${p.note ? `<div class="meta">${p.note}</div>` : ''}
-      <div class="key ${p.key_ok ? 'ok' : 'bad'}">${p.key_ok ? 'key: ' + p.key_source : 'no key: ' + p.key_source}</div>
-      <div class="row">${p.default ? '' : `<button class="ghost" data-def="${p.name}">make default</button>`}
-        <button class="ghost" data-edit="${p.name}">edit</button>
-        <button class="danger" data-del="${p.name}">${p.builtin ? 'reset' : 'remove'}</button></div>`;
-    ul.appendChild(li);
-    const o = document.createElement('option'); o.value = p.name; o.textContent = p.name + (p.default ? ' (default)' : ''); sel.appendChild(o);
-  }
-  sel.value = cur && [...sel.options].some(o => o.value === cur) ? cur : d.default;
-  $('#info').textContent = `store: ${d.store}\nffmpeg: ${d.ffmpeg || 'not found'}\nmax bytes/file: ${d.max_bytes} · timeout ${d.timeout}s`;
-  ul.querySelectorAll('[data-def]').forEach(b => b.onclick = () => api('POST', '/api/default', {name: b.dataset.def}).then(load, e => alert(e.message)));
-  ul.querySelectorAll('[data-del]').forEach(b => b.onclick = () => confirm(`Remove provider ${b.dataset.del}?`) && api('DELETE', '/api/providers/' + encodeURIComponent(b.dataset.del)).then(load, e => alert(e.message)));
-  ul.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => { const p = d.providers.find(x => x.name === b.dataset.edit); const f = $('#addForm'); f.name.value = p.name; f.base.value = p.base; f.model.value = p.model; f.auth_entry.value = p.auth_entry; f.note.value = p.note; f.api_key.value = ''; f.api_key.placeholder = p.key_ok && p.key_source === 'provider store' ? '(key stored - leave empty to keep)' : 'API key (empty = env / opencode auth.json)'; f.name.focus(); });
-}
-$('#addForm').onsubmit = async e => {
-  e.preventDefault(); const f = e.target; const b = Object.fromEntries(new FormData(f).entries()); b.make_default = f.make_default.checked;
-  try { await api('POST', '/api/providers', b); f.reset(); f.api_key.placeholder = 'API key (empty = env / opencode auth.json)'; load(); } catch (err) { alert(err.message); }
-};
-const hist = [];
-$('#ask').onclick = async () => {
-  const files = $('#files').value.split('\n').map(s => s.trim()).filter(Boolean);
-  const question = $('#question').value.trim(); const provider = $('#provider').value;
-  if (!files.length) { alert('add at least one media URL/path'); return; }
-  $('#ask').disabled = true; $('#status').textContent = 'asking ' + provider + '…'; const t0 = Date.now();
-  const a = $('#answer'); a.className = ''; a.textContent = '';
-  try {
-    const r = await api('POST', '/api/ask', {files, question, provider});
-    a.innerHTML = `<div class="head">${r.header.replace(/</g, '&lt;')}</div>` + r.answer.replace(/</g, '&lt;');
-    hist.unshift({files, question, provider, ms: Date.now() - t0});
-  } catch (err) { a.className = 'err'; a.textContent = err.message; }
-  $('#status').textContent = ((Date.now() - t0) / 1000).toFixed(1) + 's'; $('#ask').disabled = false;
-  $('#history').innerHTML = hist.map((h, i) => `<div data-i="${i}">${h.provider} · ${(h.ms / 1000).toFixed(1)}s · ${h.files.length} file(s) · ${(h.question || '(describe)').slice(0, 80).replace(/</g, '&lt;')}</div>`).join('');
-  $('#history').querySelectorAll('div').forEach(dv => dv.onclick = () => { const h = hist[dv.dataset.i]; $('#files').value = h.files.join('\n'); $('#question').value = h.question; $('#provider').value = h.provider; });
-};
-load();
-</script>
-</body>
-</html>
-"""
-
-
+WEB_DIR = Path(__file__).resolve().parent / "web"
 _STARTED = time.time()
 _STATS = {"asks": 0, "errors": 0, "last_ask": 0.0, "running": 0}
 _STATS_LOCK = threading.Lock()
+_SSE_ACTIVE = 0  # connected MCP client sessions (see _SseCounter)
 
 
 def _unit_state() -> dict:
     out = {}
     for what in ("enabled", "active"):
         try:
-            r = subprocess.run(["systemctl", "--user", f"is-{what}", "mcp-qmedia-ui.service"],
+            r = subprocess.run(["systemctl", "--user", f"is-{what}", "mcp-qmedia.service"],
                                capture_output=True, text=True, timeout=5)
             out[what] = (r.stdout or r.stderr).strip() or "?"
         except Exception:  # noqa: BLE001
@@ -547,7 +429,7 @@ def _unit_state() -> dict:
 
 
 def _status() -> dict:
-    """Same shape the messaging daemons expose - the /hub page polls it."""
+    """STATUS.md shape: name / ok / busy / state / detail + store, jobs_running, mcp_sessions, service."""
     store = _load_store()
     default = store["default"]
     prov = store["providers"][default]
@@ -560,160 +442,220 @@ def _status() -> dict:
         st = dict(_STATS)
     return {
         "name": "qmedia",
+        "ok": ok,
+        "busy": False,
+        "state": state,
+        "detail": f"default {default} · {prov['model']}" + (f" · key from {key_src}" if key_src else ""),
         "uptime_s": round(time.time() - _STARTED),
-        "connection": {"ok": ok, "state": state},
-        "account": {"label": f"default {default} · {prov['model']}" + (f" · key from {key_src}" if key_src else "")},
         "providers": _provider_rows(),
         "store": {"total": st["asks"], "newest": st["last_ask"] or None, "errors": st["errors"], "path": str(STORE)},
         "jobs_running": st["running"],
-        "mcp_sessions": None,  # stdio server: one process per agent, not tracked here
+        "mcp_sessions": _SSE_ACTIVE,
         "ffmpeg": FFMPEG,
         "service": _unit_state(),
         "tools": [{"name": "ask"}, {"name": "describe"}, {"name": "backends"}],
     }
 
 
-class UIHandler(BaseHTTPRequestHandler):
-    server_version = "qmedia-ui"
+def _json_response(obj, code: int = 200):
+    from starlette.responses import JSONResponse
 
-    def log_message(self, fmt, *args):  # quiet; stderr only on errors
-        pass
+    # CORS * so the hub page (mcp-hub.service, :8930) can poll /api/status from the browser
+    return JSONResponse(obj, status_code=code, headers={"Access-Control-Allow-Origin": "*"})
 
-    def _json(self, code: int, obj) -> None:
-        body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")  # the /hub page on the other daemons polls this
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
-    def _read_json(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(n) if n else b"{}"
-        try:
-            d = json.loads(raw or b"{}")
-        except json.JSONDecodeError:
-            raise ValueError("body is not JSON") from None
-        if not isinstance(d, dict):
-            raise ValueError("body must be a JSON object")
-        return d
+async def _read_json(request) -> dict:
+    raw = await request.body()
+    try:
+        d = json.loads(raw or b"{}")
+    except json.JSONDecodeError:
+        raise ValueError("body is not JSON") from None
+    if not isinstance(d, dict):
+        raise ValueError("body must be a JSON object")
+    return d
 
-    def do_GET(self):
-        path = self.path.split("?")[0]
-        if path == "/":
-            body = UI_HTML.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif path == "/api/providers":
+
+async def _page(request):
+    from starlette.responses import HTMLResponse
+
+    return HTMLResponse((WEB_DIR / "page.html").read_text(encoding="utf-8"))
+
+
+async def _api_status(request):
+    import anyio
+
+    return _json_response(await anyio.to_thread.run_sync(_status))
+
+
+async def _api_providers_get(request):
+    store = _load_store()
+    return _json_response({"default": store["default"], "providers": _provider_rows(),
+                           "store": str(STORE), "ffmpeg": FFMPEG, "max_bytes": MAX_BYTES, "timeout": TIMEOUT})
+
+
+async def _api_providers_post(request):
+    try:
+        d = await _read_json(request)
+        name = str(d.get("name", "")).strip().lower()
+        old_name = str(d.get("old_name", "")).strip().lower()
+        base = str(d.get("base", "")).strip().rstrip("/")
+        model = str(d.get("model", "")).strip()
+        if not name or not base or not model:
+            raise ValueError("name, base and model are required")
+        if not base.startswith(("http://", "https://")):
+            raise ValueError("base must be an http(s) URL")
+        with _STORE_LOCK:
             store = _load_store()
-            self._json(200, {"default": store["default"], "providers": _provider_rows(),
-                             "store": str(STORE), "ffmpeg": FFMPEG, "max_bytes": MAX_BYTES, "timeout": TIMEOUT})
-        elif path == "/api/status":
-            self._json(200, _status())
-        else:
-            self._json(404, {"error": "not found"})
-
-    def do_POST(self):
-        path = self.path.split("?")[0]
-        try:
-            d = self._read_json()
-            if path == "/api/providers":
-                name = str(d.get("name", "")).strip().lower()
-                base = str(d.get("base", "")).strip().rstrip("/")
-                model = str(d.get("model", "")).strip()
-                if not name or not base or not model:
-                    raise ValueError("name, base and model are required")
-                if not base.startswith(("http://", "https://")):
-                    raise ValueError("base must be an http(s) URL")
-                with _STORE_LOCK:
-                    store = _load_store()
-                    prev = store["providers"].get(name, {})
-                    key = str(d.get("api_key", ""))
-                    store["providers"][name] = {
-                        "base": base, "model": model,
-                        "auth_entry": str(d.get("auth_entry", "")).strip(),
-                        "note": str(d.get("note", "")).strip(),
-                        "api_key": key if key else prev.get("api_key", ""),
-                    }
-                    if d.get("make_default"):
-                        store["default"] = name
-                    _save_store(store)
-                self._json(200, {"ok": True})
-            elif path == "/api/default":
-                name = str(d.get("name", "")).strip().lower()
-                with _STORE_LOCK:
-                    store = _load_store()
-                    if name not in store["providers"]:
-                        raise ValueError(f"unknown provider {name!r}")
+            prev = store["providers"].get(name) or store["providers"].get(old_name) or {}
+            key = str(d.get("api_key", ""))
+            store["providers"][name] = {
+                "base": base, "model": model,
+                "auth_entry": str(d.get("auth_entry", "")).strip(),
+                "note": str(d.get("note", "")).strip(),
+                "api_key": key if key else prev.get("api_key", ""),
+            }
+            if old_name and old_name != name:
+                store["providers"].pop(old_name, None)  # built-in old name reverts to defaults
+                if store["default"] == old_name:
                     store["default"] = name
-                    _save_store(store)
-                self._json(200, {"ok": True})
-            elif path == "/api/ask":
-                files = d.get("files") or []
-                if isinstance(files, str):
-                    files = [files]
-                files = [str(f).strip() for f in files if str(f).strip()]
-                question = str(d.get("question", "")).strip()
-                provider = str(d.get("provider", "")).strip()
-                if not question:
-                    question = DESCRIBE_PROMPT
-                with _STATS_LOCK:
-                    _STATS["running"] += 1
-                try:
-                    out = _run(files, question, provider, str(d.get("system", "")))
-                    with _STATS_LOCK:
-                        _STATS["asks"] += 1
-                        _STATS["last_ask"] = time.time()
-                except Exception:
-                    with _STATS_LOCK:
-                        _STATS["errors"] += 1
-                    raise
-                finally:
-                    with _STATS_LOCK:
-                        _STATS["running"] -= 1
-                header, _, answer = out.partition("\n\n")
-                self._json(200, {"header": header, "answer": answer})
-            else:
-                self._json(404, {"error": "not found"})
-        except Exception as e:  # noqa: BLE001
-            self._json(400, {"error": str(e)})
+            if d.get("make_default"):
+                store["default"] = name
+            _save_store(store)
+        return _json_response({"ok": True})
+    except Exception as e:  # noqa: BLE001
+        return _json_response({"error": str(e)}, 400)
 
-    def do_DELETE(self):
-        path = self.path.split("?")[0]
-        if not path.startswith("/api/providers/"):
-            self._json(404, {"error": "not found"})
-            return
-        from urllib.parse import unquote
-        name = unquote(path[len("/api/providers/"):]).strip().lower()
+
+async def _api_providers_delete(request):
+    from urllib.parse import unquote
+
+    name = unquote(request.path_params["name"]).strip().lower()
+    with _STORE_LOCK:
+        store = _load_store()
+        if name not in store["providers"]:
+            return _json_response({"error": f"unknown provider {name!r}"}, 404)
+        store["providers"].pop(name, None)  # built-ins reappear (reset) via _load_store
+        if store["default"] == name:
+            store["default"] = BUILTIN_DEFAULT
+        _save_store(store)
+    return _json_response({"ok": True})
+
+
+async def _api_default(request):
+    try:
+        d = await _read_json(request)
+        name = str(d.get("name", "")).strip().lower()
         with _STORE_LOCK:
             store = _load_store()
             if name not in store["providers"]:
-                self._json(404, {"error": f"unknown provider {name!r}"})
-                return
-            store["providers"].pop(name, None)  # built-ins reappear (reset) via _load_store
-            if store["default"] == name:
-                store["default"] = BUILTIN_DEFAULT
+                raise ValueError(f"unknown provider {name!r}")
+            store["default"] = name
             _save_store(store)
-        self._json(200, {"ok": True})
+        return _json_response({"ok": True})
+    except Exception as e:  # noqa: BLE001
+        return _json_response({"error": str(e)}, 400)
 
 
-def _ui_server(port: int) -> None:
-    srv = ThreadingHTTPServer(("127.0.0.1", port), UIHandler)
-    srv.daemon_threads = True
-    _log(f"web UI on http://127.0.0.1:{port}")
-    srv.serve_forever()
+def _ask_blocking(files: list[str], question: str, provider: str, system: str) -> dict:
+    with _STATS_LOCK:
+        _STATS["running"] += 1
+    try:
+        out = _run(files, question, provider, system)
+        with _STATS_LOCK:
+            _STATS["asks"] += 1
+            _STATS["last_ask"] = time.time()
+    except Exception:
+        with _STATS_LOCK:
+            _STATS["errors"] += 1
+        raise
+    finally:
+        with _STATS_LOCK:
+            _STATS["running"] -= 1
+    header, _, answer = out.partition("\n\n")
+    return {"header": header, "answer": answer}
+
+
+async def _api_ask(request):
+    import anyio
+
+    try:
+        d = await _read_json(request)
+        files = d.get("files") or []
+        if isinstance(files, str):
+            files = [files]
+        files = [str(f).strip() for f in files if str(f).strip()]
+        question = str(d.get("question", "")).strip() or DESCRIBE_PROMPT
+        provider = str(d.get("provider", "")).strip()
+        res = await anyio.to_thread.run_sync(_ask_blocking, files, question, provider, str(d.get("system", "")))
+        return _json_response(res)
+    except Exception as e:  # noqa: BLE001
+        return _json_response({"error": str(e)}, 400)
+
+
+class _SseCounter:
+    """ASGI middleware counting open /sse connections = connected MCP client sessions."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        global _SSE_ACTIVE
+        if scope.get("type") != "http" or scope.get("path") != "/sse":
+            return await self.app(scope, receive, send)
+        _SSE_ACTIVE += 1
+        gone = False
+
+        def _drop():
+            nonlocal gone
+            global _SSE_ACTIVE
+            if not gone:
+                gone = True
+                _SSE_ACTIVE -= 1
+
+        async def _receive():  # the SDK's SSE handler may linger after the client leaves - count the disconnect itself
+            msg = await receive()
+            if msg.get("type") == "http.disconnect":
+                _drop()
+            return msg
+
+        try:
+            await self.app(scope, _receive, send)
+        finally:
+            _drop()
+
+
+def _build_app():
+    from starlette.routing import Route
+
+    app = mcp.sse_app()  # /sse + /messages/
+    app.router.routes.extend([
+        Route("/", _page, methods=["GET"]),
+        Route("/api/status", _api_status, methods=["GET"]),
+        Route("/api/providers", _api_providers_get, methods=["GET"]),
+        Route("/api/providers", _api_providers_post, methods=["POST"]),
+        Route("/api/providers/{name:path}", _api_providers_delete, methods=["DELETE"]),
+        Route("/api/default", _api_default, methods=["POST"]),
+        Route("/api/ask", _api_ask, methods=["POST"]),
+    ])
+    app.add_middleware(_SseCounter)
+    return app
+
+
+def serve(port: int) -> None:
+    import uvicorn
+
+    _log(f"qmedia daemon: MCP SSE http://127.0.0.1:{port}/sse · web UI http://127.0.0.1:{port}/")
+    uvicorn.run(_build_app(), host="127.0.0.1", port=port, log_level="warning")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "ui":
-        port = int(sys.argv[2]) if len(sys.argv) > 2 else UI_PORT
+    mode = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    if mode == "stdio":  # stand-alone stdio MCP (no UI), e.g. for a client that cannot do SSE
+        mcp.run()
+    elif mode == "serve":
         try:
-            _ui_server(port)
+            serve(int(sys.argv[2]) if len(sys.argv) > 2 else PORT)
         except KeyboardInterrupt:
             pass
     else:
-        mcp.run()
+        sys.exit(f"usage: server.py [serve [port] | stdio]  (default: serve on {PORT})")

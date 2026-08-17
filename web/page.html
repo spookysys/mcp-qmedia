@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qmedia · providers & probe</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; background: #14161a; color: #e8e8ea;
+         display: flex; height: 100vh; }
+  #side { width: 420px; border-right: 1px solid #26292f; padding: 12px; overflow: auto; }
+  #side h1 { font-size: 22px; font-weight: 700; margin: 0 0 10px; letter-spacing: .01em; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: #8b90a0; margin: 14px 0 6px; }
+  #providers { padding: 0; margin: 0; list-style: none; }
+  #providers li { list-style: none; padding: 7px 8px; border-radius: 6px; background: #1c1f26; margin: 4px 0; }
+  #providers li.default { outline: 1px solid #4f7cff; }
+  #providers .name { font-weight: 600; }
+  #providers .meta { color: #8b90a0; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+  #providers .key { font-size: 12px; }
+  #providers .key.ok { color: #4ade80; } #providers .key.bad { color: #f87171; }
+  #providers .row { display: flex; gap: 6px; margin-top: 5px; }
+  input, textarea, select { background: #1c1f26; border: 1px solid #2a2e37; color: #e8e8ea; border-radius: 8px; padding: 7px 10px; font: inherit; }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: #4f7cff; }
+  button { background: #4f7cff; border: 0; color: #fff; border-radius: 8px; padding: 7px 12px; cursor: pointer; font: inherit; }
+  button.ghost { background: none; border: 1px solid #2a2e37; color: #8b90a0; }
+  button.danger { background: none; border: 1px solid #5b2a2a; color: #f87171; }
+  button:disabled { opacity: .5; cursor: default; }
+  form.stack { display: flex; flex-direction: column; gap: 6px; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 16px; gap: 10px; overflow: auto; }
+  #main textarea { width: 100%; }
+  #files { min-height: 64px; font-family: ui-monospace, monospace; font-size: 12px; }
+  #question { min-height: 56px; }
+  #probeRow { display: flex; gap: 8px; align-items: center; }
+  #answer { flex: 1; white-space: pre-wrap; word-break: break-word; background: #1c1f26; border-radius: 8px; padding: 12px; overflow: auto; font-size: 13px; }
+  #answer.err { color: #f87171; }
+  #answer .head { color: #8b90a0; font-family: ui-monospace, monospace; font-size: 12px; margin-bottom: 8px; }
+  #history { max-height: 30vh; overflow: auto; }
+  #history div { color: #8b90a0; font-size: 12px; padding: 3px 0; border-top: 1px solid #26292f; cursor: pointer; }
+  small { color: #8b90a0; }
+  .hint { font-size: 12px; color: #8b90a0; margin: 0 0 6px; }
+</style>
+</head>
+<body>
+<div id="side">
+  <h1>qmedia <a href="http://127.0.0.1:8930/" style="font-weight:400;font-size:12px;color:#60a5fa;text-decoration:none">All daemons ↗</a></h1>
+  <div id="info" class="meta"></div>
+  <h2>Providers</h2>
+  <ul id="providers"></ul>
+  <details id="formBox">
+    <summary id="formSummary">Add / edit provider</summary>
+    <form class="stack" id="addForm">
+      <input name="name" id="fname" placeholder="name (e.g. go, free, openrouter)" required>
+      <input name="base" placeholder="base URL, e.g. https://opencode.ai/zen/go/v1" required>
+      <input name="model" placeholder="model, e.g. mimo-v2.5" required>
+      <input name="api_key" type="password" placeholder="API key (empty = env / opencode auth.json)">
+      <input name="auth_entry" placeholder="opencode auth.json entry to fall back to (e.g. opencode-go)">
+      <input name="note" placeholder="note">
+      <div class="row"><button type="submit" id="formSubmit">Add / save provider</button>
+        <button type="button" class="ghost" id="formCancel" hidden>cancel edit</button>
+        <label><input type="checkbox" name="make_default"> make default</label></div>
+    </form>
+    <p class="hint" id="hint">Saving with an existing name edits that provider; a new name adds one.
+      Built-ins always stay in the list — “reset” only clears your custom edits / stored key.</p>
+  </details>
+</div>
+<div id="main">
+  <h2>Probe</h2>
+  <textarea id="files" placeholder="one media source per line: http(s):// URL or local path (image / audio / video)"></textarea>
+  <textarea id="question" placeholder="question (empty = thorough describe)"></textarea>
+  <div id="probeRow">
+    <select id="provider"></select>
+    <button id="ask">Ask</button>
+    <small id="status"></small>
+  </div>
+  <div id="answer"><small>answers appear here · keys are never sent to the browser</small></div>
+  <h2>History (this page)</h2>
+  <div id="history"></div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const api = (m, u, b) => fetch(u, {method: m, headers: {'content-type': 'application/json'}, body: b ? JSON.stringify(b) : undefined}).then(async r => { const t = await r.text(); let j; try { j = JSON.parse(t); } catch { j = {error: t}; } if (!r.ok) throw new Error(j.error || t); return j; });
+let formName = ''; // provider being edited; '' = add mode
+function setFormMode() {
+  const editing = !!formName;
+  $('#formSummary').textContent = editing ? 'Edit provider · ' + formName : 'Add / edit provider';
+  $('#formSubmit').textContent = editing ? 'Save changes' : 'Add / save provider';
+  $('#formCancel').hidden = !editing;
+  $('#fname').readOnly = false;
+  $('#fname').title = editing ? 'you can rename — the old entry is removed (built-ins revert to defaults)' : '';
+  $('#hint').textContent = editing
+    ? 'Renaming this provider removes the old entry (a built-in old name reverts to its defaults). A name that already exists gets updated instead.'
+    : 'Saving with an existing name edits that provider; a new name adds one. Built-ins always stay in the list — “reset” only clears your custom edits / stored key.';
+}
+function resetForm() {
+  const f = $('#addForm'); f.reset(); formName = ''; setFormMode();
+  f.api_key.placeholder = 'API key (empty = env / opencode auth.json)';
+  $('#formBox').open = false;
+}
+function enterEdit(p) {
+  const f = $('#addForm'); formName = p.name; $('#formBox').open = true; setFormMode();
+  f.name.value = p.name; f.base.value = p.base; f.model.value = p.model;
+  f.auth_entry.value = p.auth_entry; f.note.value = p.note;
+  f.make_default.checked = false; f.api_key.value = '';
+  f.api_key.placeholder = p.key_ok && p.key_source === 'provider store' ? '(key stored - leave empty to keep)' : 'API key (empty = env / opencode auth.json)';
+  f.name.focus();
+}
+async function load() {
+  const d = await api('GET', '/api/providers');
+  const ul = $('#providers'); ul.innerHTML = '';
+  const sel = $('#provider'); const cur = sel.value; sel.innerHTML = '';
+  for (const p of d.providers) {
+    const li = document.createElement('li'); if (p.default) li.className = 'default';
+    li.innerHTML = `<div><span class="name">${p.name}</span> ${p.default ? '<small>· default</small>' : ''} ${p.builtin ? '<small>· built-in</small>' : ''}</div>
+      <div class="meta">${p.model} @ ${p.base}</div>${p.note ? `<div class="meta">${p.note}</div>` : ''}
+      <div class="key ${p.key_ok ? 'ok' : 'bad'}">${p.key_ok ? 'key: ' + p.key_source : 'no key: ' + p.key_source}</div>
+      <div class="row">${p.default ? '' : `<button class="ghost" data-def="${p.name}">make default</button>`}
+        <button class="ghost" data-edit="${p.name}">edit</button>
+        <button class="danger" data-del="${p.name}" title="${p.builtin ? 'reset: clears custom edits / stored key, provider stays' : 'remove: deletes this provider'}">${p.builtin ? 'reset' : 'remove'}</button></div>`;
+    ul.appendChild(li);
+    const o = document.createElement('option'); o.value = p.name; o.textContent = p.name + (p.default ? ' (default)' : ''); sel.appendChild(o);
+  }
+  sel.value = cur && [...sel.options].some(o => o.value === cur) ? cur : d.default;
+  $('#info').textContent = `store: ${d.store}\nffmpeg: ${d.ffmpeg || 'not found'}\nmax bytes/file: ${d.max_bytes} · timeout ${d.timeout}s`;
+  ul.querySelectorAll('[data-def]').forEach(b => b.onclick = () => api('POST', '/api/default', {name: b.dataset.def}).then(load, e => alert(e.message)));
+  ul.querySelectorAll('[data-del]').forEach(b => { const p = d.providers.find(x => x.name === b.dataset.del);
+    b.onclick = () => { const msg = p.builtin
+      ? `Reset built-in '${p.name}' to its defaults? This clears your custom edits and any stored API key — the provider stays in the list.`
+      : `Remove provider '${p.name}'? This cannot be undone.`;
+      if (confirm(msg)) api('DELETE', '/api/providers/' + encodeURIComponent(p.name)).then(load, e => alert(e.message)); }; });
+  ul.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => { const p = d.providers.find(x => x.name === b.dataset.edit); enterEdit(p); });
+}
+$('#addForm').onsubmit = async e => {
+  e.preventDefault(); const f = e.target; const b = Object.fromEntries(new FormData(f).entries()); b.make_default = f.make_default.checked;
+  if (formName) b.old_name = formName;
+  try { await api('POST', '/api/providers', b); resetForm(); load(); } catch (err) { alert(err.message); }
+};
+$('#formCancel').onclick = resetForm;
+const hist = [];
+$('#ask').onclick = async () => {
+  const files = $('#files').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const question = $('#question').value.trim(); const provider = $('#provider').value;
+  if (!files.length) { alert('add at least one media URL/path'); return; }
+  $('#ask').disabled = true; $('#status').textContent = 'asking ' + provider + '…'; const t0 = Date.now();
+  const a = $('#answer'); a.className = ''; a.textContent = '';
+  try {
+    const r = await api('POST', '/api/ask', {files, question, provider});
+    a.innerHTML = `<div class="head">${r.header.replace(/</g, '&lt;')}</div>` + r.answer.replace(/</g, '&lt;');
+    hist.unshift({files, question, provider, ms: Date.now() - t0});
+  } catch (err) { a.className = 'err'; a.textContent = err.message; }
+  $('#status').textContent = ((Date.now() - t0) / 1000).toFixed(1) + 's'; $('#ask').disabled = false;
+  $('#history').innerHTML = hist.map((h, i) => `<div data-i="${i}">${h.provider} · ${(h.ms / 1000).toFixed(1)}s · ${h.files.length} file(s) · ${(h.question || '(describe)').slice(0, 80).replace(/</g, '&lt;')}</div>`).join('');
+  $('#history').querySelectorAll('div').forEach(dv => dv.onclick = () => { const h = hist[dv.dataset.i]; $('#files').value = h.files.join('\n'); $('#question').value = h.question; $('#provider').value = h.provider; });
+};
+load();
+</script>
+</body>
+</html>

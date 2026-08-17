@@ -1,5 +1,5 @@
 [Unit]
-Description=mcp-qmedia web UI (providers, API keys, media probe) on 127.0.0.1:8938
+Description=mcp-qmedia daemon: MCP over SSE (/sse) + web UI (providers, API keys, media probe) on 127.0.0.1:8938
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +9,7 @@ Type=simple
 Environment=MCP_QMEDIA_DIR=%h/.local/src/ai-agent-setup/mcp/mcp-qmedia
 Environment=MCP_QMEDIA_PYTHON=%h/.local/src/ai-agent-setup/mcp/mcp-qmedia/.venv/bin/python
 EnvironmentFile=-%h/.config/mcp-qmedia/env
-ExecStart=/usr/bin/env ${MCP_QMEDIA_PYTHON} ${MCP_QMEDIA_DIR}/server.py ui
+ExecStart=/usr/bin/env ${MCP_QMEDIA_PYTHON} ${MCP_QMEDIA_DIR}/server.py serve
 Restart=on-failure
 RestartSec=5
 

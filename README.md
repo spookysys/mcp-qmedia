@@ -25,19 +25,21 @@ the provider's `auth_entry`, then any other entry with a key. So if you are logg
 go / zen (`opencode auth login`), there is nothing to configure. `deploy/env.example` holds only
 non-secret settings; the store is written 0600 and lives under `~/.config`, not in any repo.
 
-## Web UI — providers, keys, probe
+## Daemon: MCP over SSE + web UI on one port
 
-`mcp-qmedia ui` (or `server.py ui [port]`, systemd user unit `deploy/mcp-qmedia-ui.service`) serves
-**http://127.0.0.1:8938**: list of providers (default marked, key status + where the key comes
+`mcp-qmedia` (= `server.py serve [port]`, systemd user unit `deploy/mcp-qmedia.service`) is a daemon on
+**http://127.0.0.1:8938**: the MCP server at `/sse` (both agents connect there — one process, not one
+per agent session) and the web UI at `/`: list of providers (default marked, key status + where the key comes list of providers (default marked, key status + where the key comes
 from — the key itself is never sent to the browser), add/edit/remove (built-ins can be reset,
 not removed), make default, and a **probe** panel: paste http(s) URLs or local paths (one per
 line), a question (empty = the `describe` prompt), pick a provider, Ask — answer + timing +
 per-page history. JSON API behind it: `GET/POST /api/providers`, `DELETE /api/providers/<name>`,
 `POST /api/default`, `POST /api/ask {files, question, provider}`, and `GET /api/status` (CORS `*`,
-same shape as the messaging daemons' status — the `/hub` page served by those daemons polls it; a
-hub entry is `{ name: "qmedia", port: 8938, unit: "mcp-qmedia-ui.service" }`). The page links to
-"All daemons ↗" (`http://127.0.0.1:8934/hub`).
-The stdio MCP server reads the same store on every call, so UI changes apply immediately.
+same shape as the messaging daemons' status — the hub page (ai-agent-setup `mcp-hub.service`, http://127.0.0.1:8930/) polls it; a
+the field list is `ai-agent-setup/web/STATUS.md`; the hub entry is `{ name: "Qmedia", port: 8938, unit: "mcp-qmedia.service" }`).
+The page links to "All daemons ↗" (`http://127.0.0.1:8930/`); the page itself is `web/page.html`.
+The MCP tools read the same store on every call, so UI changes apply immediately.
+`server.py stdio` is still there for a client that cannot do SSE (no UI in that mode).
 
 ## Tools (prefix `qmedia_` in opencode, `mcp__qmedia__` in Claude Code)
 
@@ -69,31 +71,31 @@ Verified 2026-08-17 on `go`: image OCR, wav transcription (espeak sample), 3 s m
 
 ## Setup
 
-Layout: `server.py` (MCP server + web UI), `deploy/bin/mcp-qmedia` (stdio launcher),
-`deploy/mcp-qmedia-ui.service` (systemd user unit for the UI), `deploy/env.example` (optional
-non-secret settings). Wire it in with symlinks so a `git pull` updates the machine.
+Layout: `server.py` (MCP server + web UI), `web/page.html` (the UI), `deploy/bin/mcp-qmedia` (launcher:
+daemon by default, `stdio` for a plain stdio server), `deploy/mcp-qmedia.service` (systemd user unit),
+`deploy/env.example` (optional non-secret settings). Wire it in with symlinks so a `git pull` updates the machine.
 
 ```sh
 git clone git@github.com:spookysys/mcp-qmedia.git ~/.local/src/mcp-qmedia
 cd ~/.local/src/mcp-qmedia
 uv venv .venv --python 3.14 && uv pip install --python .venv/bin/python 'mcp>=1.9,<2' httpx
 ln -s "$PWD/deploy/bin/mcp-qmedia" ~/.local/bin/          # launcher
-ln -s "$PWD/deploy/mcp-qmedia-ui.service" ~/.config/systemd/user/   # web UI (edit MCP_QMEDIA_DIR if not this path)
-systemctl --user daemon-reload && systemctl --user enable --now mcp-qmedia-ui
+ln -s "$PWD/deploy/mcp-qmedia.service" ~/.config/systemd/user/   # daemon (edit MCP_QMEDIA_DIR if not this path)
+systemctl --user daemon-reload && systemctl --user enable --now mcp-qmedia
 # optional: mkdir -p ~/.config/mcp-qmedia && cp deploy/env.example ~/.config/mcp-qmedia/env
 ```
 
 opencode (`opencode.jsonc`):
 
 ```jsonc
-"qmedia": { "type": "local", "command": ["/home/YOU/.local/bin/mcp-qmedia"], "enabled": true }
+"qmedia": { "type": "remote", "url": "http://127.0.0.1:8938/sse", "enabled": true }
 // permission: "qmedia_*": "allow"
 ```
 
 Claude Code (user scope):
 
 ```sh
-claude mcp add -s user qmedia --transport stdio -- ~/.local/bin/mcp-qmedia
+claude mcp add -s user qmedia --transport sse http://127.0.0.1:8938/sse
 # settings.json permissions.allow: "mcp__qmedia__*"
 ```
 
@@ -103,7 +105,7 @@ claude mcp add -s user qmedia --transport stdio -- ~/.local/bin/mcp-qmedia
 |---|---|---|
 | `QMEDIA_BACKEND` | store default (`go`) | default provider override |
 | `QMEDIA_STORE` | `~/.config/mcp-qmedia/providers.json` | provider store (0600, may hold keys) |
-| `QMEDIA_UI_PORT` | `8938` | web UI port (127.0.0.1) |
+| `QMEDIA_PORT` | `8938` | daemon port: MCP `/sse` + web UI (127.0.0.1) |
 | `QMEDIA_API_KEY`, `OPENCODE_API_KEY` | — | key override for providers without a stored key (else opencode's `auth.json`) |
 | `QMEDIA_AUTH_JSON` | `~/.local/share/opencode/auth.json` | where opencode keeps provider keys |
 | `QMEDIA_MAX_BYTES` | `20000000` | per-file cap before ffmpeg transcoding |
