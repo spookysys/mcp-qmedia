@@ -26,6 +26,7 @@ stdout is the MCP protocol channel: all diagnostics go to stderr.
 """
 
 import base64
+import asyncio
 import json
 import logging
 import mimetypes
@@ -116,13 +117,18 @@ def _load_store() -> dict:
         _log(f"cannot read {STORE}: {e}")
     provs: dict[str, dict] = {}
     for n, p in (data.get("providers") or {}).items():
+        n = str(n).strip().lower()  # names are compared lower-cased everywhere; a hand-edited store must not crash lookups
         if isinstance(p, dict) and p.get("base") and p.get("model"):
             provs[n] = {"base": p["base"].rstrip("/"), "model": p["model"],
                         "auth_entry": p.get("auth_entry", ""), "note": p.get("note", ""),
                         "api_key": p.get("api_key", "")}
     for n, p in BUILTIN_PROVIDERS.items():
         provs.setdefault(n, dict(p))
-    default = os.environ.get("QMEDIA_BACKEND", "").strip().lower() or data.get("default") or BUILTIN_DEFAULT
+    env_default = os.environ.get("QMEDIA_BACKEND", "").strip().lower()
+    if env_default and env_default not in provs:
+        # Never fall back silently to the paid built-in when the operator asked for something else.
+        raise ValueError(f"QMEDIA_BACKEND={env_default!r} is not a known provider; known: {', '.join(provs)}")
+    default = env_default or str(data.get("default") or "").strip().lower() or BUILTIN_DEFAULT
     if default not in provs:
         default = BUILTIN_DEFAULT
     return {"default": default, "providers": provs}
@@ -163,16 +169,17 @@ def _api_key(name: str) -> tuple[str, str]:
         v = os.environ.get(var, "").strip()
         if v:
             return v, f"env {var}"
-    auth = _auth_json()
+    # Only the provider's OWN auth.json entry — never "the first key of any
+    # entry": that would send an unrelated provider's secret to this base URL.
     entry = prov.get("auth_entry", "")
-    order = ([entry] if entry else []) + [e for e in auth if e != entry]
-    for e in order:
-        k = (auth.get(e) or {}).get("key", "")
+    if entry:
+        k = (_auth_json().get(entry) or {}).get("key", "")
         if k:
-            return k, f"{AUTH_JSON.name} [{e}]"
+            return k, f"{AUTH_JSON.name} [{entry}]"
     raise RuntimeError(
-        f"no API key for provider {name!r}: set one in the UI/store, or QMEDIA_API_KEY / "
-        f"OPENCODE_API_KEY, or log in to opencode ('opencode auth login' -> {AUTH_JSON})"
+        f"no API key for provider {name!r}: set one in the UI/store, or QMEDIA_API_KEY / OPENCODE_API_KEY"
+        + (f", or log in to opencode so {AUTH_JSON} has an '{entry}' entry ('opencode auth login')" if entry else
+           f" (this provider has no auth_entry, so opencode's {AUTH_JSON.name} is not consulted)")
     )
 
 
@@ -211,6 +218,9 @@ def _fetch(src: str) -> tuple[str, bytes, str]:
         r.raise_for_status()
         return src, r.content, r.headers.get("content-type", "")
     p = Path(src).expanduser()
+    if not p.is_absolute():
+        raise ValueError(f"local paths must be absolute (or ~/…): {src!r} — the server runs as a shared daemon, "
+                         "its working directory is not your project")
     if not p.is_file():
         raise FileNotFoundError(f"not a file: {src}")
     return str(p), p.read_bytes(), ""
@@ -343,25 +353,27 @@ def _run(files: list[str], question: str, backend: str, system: str) -> str:
 # ---------------------------------------------------------------- tools
 
 @mcp.tool()
-def ask(files: list[str], question: str, backend: str = "", system: str = "") -> str:
+async def ask(files: list[str], question: str, backend: str = "", system: str = "") -> str:
     """Ask a question about one or more media files (images, audio, video).
 
-    files: local paths (~ ok) or http(s) URLs. Several files go in one call, so
-    the model can compare/relate them. question: what you want to know
-    (describe, read the text, transcribe, what happens at 0:42, is X visible...).
-    backend: '' = default provider, or a name from backends() (built in: 'go', 'free'). system: optional
-    system prompt. Returns the model's text answer with a short header."""
-    return _run(files, question, backend, system)
+    files: ABSOLUTE local paths (~ ok; the server is a shared daemon, its cwd is
+    not your project) or http(s) URLs. Several files go in one call, so the
+    model can compare/relate them. question: what you want to know (describe,
+    read the text, transcribe, what happens at 0:42, is X visible...).
+    backend: '' = default provider, or a name from backends() (built in:
+    'mimo-v2.5 - opencode go' and 'mimo-v2.5-free - opencode zen'). system:
+    optional system prompt. Returns the model's text answer with a short header."""
+    return await asyncio.to_thread(_run, files, question, backend, system)
 
 
 @mcp.tool()
-def describe(files: list[str], backend: str = "") -> str:
+async def describe(files: list[str], backend: str = "") -> str:
     """Thorough default description of media files - no question needed.
 
     Images: layout, objects, people, all visible text verbatim. Audio: verbatim
     transcript with speakers, plus non-speech sounds. Video: scene-by-scene with
-    timestamps, on-screen text and speech transcript."""
-    return _run(files, DESCRIBE_PROMPT, backend, "")
+    timestamps, on-screen text and speech transcript. files: absolute paths or URLs."""
+    return await asyncio.to_thread(_run, files, DESCRIBE_PROMPT, backend, "")
 
 
 DESCRIBE_PROMPT = (
@@ -390,9 +402,13 @@ def _provider_rows() -> list[dict]:
 
 
 @mcp.tool()
-def backends() -> str:
+async def backends() -> str:
     """List providers (endpoint, model, which is default, whether an API key resolves) and ffmpeg
-    availability. Never prints a key. Manage providers in the web UI (http://127.0.0.1:8938/)."""
+    availability. Never prints a key. Manage providers in the web UI (`mcp-qmedia ui`, http://127.0.0.1:8938/)."""
+    return await asyncio.to_thread(_backends_text)
+
+
+def _backends_text() -> str:
     lines = []
     for r in _provider_rows():
         mark = " (default)" if r["default"] else ""
@@ -430,7 +446,12 @@ def _unit_state() -> dict:
 
 def _status() -> dict:
     """Same field set as the daemons' /api/status (ai-agent-setup/web/STATUS.md) - here for the wizard page only."""
-    store = _load_store()
+    try:
+        store = _load_store()
+    except ValueError as e:  # e.g. QMEDIA_BACKEND names an unknown provider
+        return {"name": "qmedia", "ok": False, "busy": False, "state": "misconfigured", "detail": str(e),
+                "uptime_s": round(time.time() - _STARTED), "providers": [], "store": None, "jobs_running": 0,
+                "mcp_sessions": None, "ffmpeg": FFMPEG, "service": _unit_state(), "tools": []}
     default = store["default"]
     prov = store["providers"][default]
     try:
@@ -591,12 +612,40 @@ async def _api_ask(request):
         return _json_response({"error": str(e)}, 400)
 
 
+class _OriginGuard:
+    """The setup wizard is for the browser tab that opened it (same origin) —
+    another web page must not be able to register a provider (attacker base URL)
+    and POST /api/ask to upload local files + a key there. Non-GET requests with a
+    foreign Origin → 403; no CORS."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("method", "GET") not in ("GET", "HEAD"):
+            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            origin = headers.get("origin")
+            if origin:
+                from urllib.parse import urlsplit
+
+                try:
+                    same = urlsplit(origin).netloc == headers.get("host", "")
+                except Exception:  # noqa: BLE001
+                    same = False
+                if not same:
+                    await send({"type": "http.response.start", "status": 403, "headers": [(b"content-type", b"application/json")]})
+                    await send({"type": "http.response.body", "body": b'{"error":"cross-origin write refused"}'})
+                    return
+        await self.app(scope, receive, send)
+
+
 def _build_app():
     from starlette.routing import Route
 
     from starlette.applications import Starlette
+    from starlette.middleware import Middleware
 
-    return Starlette(routes=[
+    return Starlette(middleware=[Middleware(_OriginGuard)], routes=[
         Route("/", _page, methods=["GET"]),
         Route("/api/status", _api_status, methods=["GET"]),
         Route("/api/providers", _api_providers_get, methods=["GET"]),

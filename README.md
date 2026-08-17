@@ -14,8 +14,8 @@ Per call: `backend="<name>"`; `QMEDIA_BACKEND` overrides the stored default.
 
 | provider | endpoint | model | cost / limits | key entry in opencode's `auth.json` |
 |---|---|---|---|---|
-| `go` (**default**) | `https://opencode.ai/zen/go/v1` | `mimo-v2.5` | ~$0.14/M in, 1M ctx | `opencode-go` |
-| `free` | `https://opencode.ai/zen/v1` | `mimo-v2.5-free` | free, 200k ctx, rate limited (429 `FreeUsageLimitError` when exhausted) | `opencode` |
+| `mimo-v2.5 - opencode go` (**default**) | `https://opencode.ai/zen/go/v1` | `mimo-v2.5` | ~$0.14/M in, 1M ctx | `opencode-go` |
+| `mimo-v2.5-free - opencode zen` | `https://opencode.ai/zen/v1` | `mimo-v2.5-free` | free, 200k ctx, rate limited (429 `FreeUsageLimitError` when exhausted) | `opencode` |
 
 ## API keys — never in this repo
 
@@ -41,15 +41,15 @@ The MCP server reads the same store on every call, so changes apply immediately 
 
 ## Tools (prefix `qmedia_` in opencode, `mcp__qmedia__` in Claude Code)
 
-- `ask(files, question, backend="", system="")` — the main tool. `files` is a list of local paths
-  (`~` ok) or `http(s)://` URLs; several files in one call so the model can relate them. Returns a
-  short header (`[go/mimo-v2.5 · 2 file(s) · 8.8s]` + per-file type/size) and the answer.
+- `ask(files, question, backend="", system="")` — the main tool. `files` is a list of **absolute** local paths (`~/…` ok; the server is a shared daemon, its cwd is not your project)
+  or `http(s)://` URLs; several files in one call so the model can relate them. Returns a
+  short header (`[mimo-v2.5 - opencode go/mimo-v2.5 · 2 file(s) · 8.8s]` + per-file type/size) and the answer.
 - `describe(files, backend="")` — no question needed: thorough description; images incl. all visible
   text verbatim, audio as verbatim transcript, video scene-by-scene with timestamps + transcript.
 - `backends()` — providers: endpoints, models, which is default, whether a key resolves for each
   (never prints the key), ffmpeg availability, limits, store path.
 
-Permission: all three are read-only and cheap → **allow** in both agents.
+Permission: all three are read-only and cheap → **allow** in both agents. Note: `ask`/`describe` upload the given files to the configured provider (a paid API for the default) — an allow-list wildcard means an agent can do that without asking, plan mode included; keep the default on the free provider if that matters to you.
 
 ## Media handling
 
@@ -64,7 +64,7 @@ Type detection: extension table → `mimetypes` → HTTP `Content-Type` → magi
 ffmpeg is optional but strongly recommended (`dnf install ffmpeg`); without it, only files that
 need no transcoding work.
 
-Verified 2026-08-17 on `go`: image OCR, wav transcription (espeak sample), 3 s mp4 with beep
+Verified 2026-08-17 on `mimo-v2.5 - opencode go`: image OCR, wav transcription (espeak sample), 3 s mp4 with beep
 (frames + soundtrack), and image+audio in one call.
 
 ## Setup
@@ -103,10 +103,10 @@ claude mcp add -s user qmedia --transport stdio -- ~/.local/bin/mcp-qmedia
 
 | var | default | meaning |
 |---|---|---|
-| `QMEDIA_BACKEND` | store default (`go`) | default provider override |
+| `QMEDIA_BACKEND` | store default (`mimo-v2.5 - opencode go`) | default provider override; an unknown name is an error (never a silent fallback to the paid built-in) |
 | `QMEDIA_STORE` | `~/.config/mcp-qmedia/providers.json` | provider store (0600, may hold keys) |
 | `QMEDIA_UI_PORT` | `8938` | port of the on-demand setup wizard (`mcp-qmedia ui`, 127.0.0.1) |
-| `QMEDIA_API_KEY`, `OPENCODE_API_KEY` | — | key override for providers without a stored key (else opencode's `auth.json`) |
+| `QMEDIA_API_KEY`, `OPENCODE_API_KEY` | — | key override for providers without a stored key (else the provider's own `auth_entry` in opencode's `auth.json` — never another entry's key) |
 | `QMEDIA_AUTH_JSON` | `~/.local/share/opencode/auth.json` | where opencode keeps provider keys |
 | `QMEDIA_MAX_BYTES` | `20000000` | per-file cap before ffmpeg transcoding |
 | `QMEDIA_TIMEOUT` | `300` | model call timeout, seconds |
