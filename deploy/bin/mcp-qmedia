@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Launch the qmedia MCP server over stdio (this is how opencode and Claude Code
+# start it - it is not a daemon).
+#
+# Uses the venv inside the checkout by default; override the interpreter with
+# MCP_QMEDIA_PYTHON. Resolves the checkout from its own location, so it can be
+# symlinked anywhere (e.g. ln -s $PWD/deploy/bin/mcp-qmedia ~/.local/bin/).
+# Optional non-secret settings: ~/.config/mcp-qmedia/env (copy deploy/env.example)
+# or MCP_QMEDIA_ENV. The API key is NOT read here - the server takes it from
+# QMEDIA_API_KEY / OPENCODE_API_KEY or opencode's own auth.json (see README).
+set -euo pipefail
+repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+settings="${MCP_QMEDIA_ENV:-$HOME/.config/mcp-qmedia/env}"
+if [[ -r "$settings" ]]; then
+	# shellcheck source=/dev/null
+	set -a; source "$settings"; set +a
+fi
+exec "${MCP_QMEDIA_PYTHON:-$repo/.venv/bin/python}" "$repo/server.py" "$@"
