@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Launch qmedia: no args (or `serve [port]`) = the daemon (MCP over SSE + web UI on
-# one port, default 8938 - what deploy/mcp-qmedia.service runs); `stdio` = a plain
-# stdio MCP server for a client that cannot do SSE.
+# Launch the qmedia MCP server over stdio (no args) - run once and shared by
+# ai-agent-setup's mcp-bridge, or per session by a client. `ui [port]` starts the
+# on-demand setup wizard + probe page (not a daemon).
 #
 # Uses the venv inside the checkout by default; override the interpreter with
 # MCP_QMEDIA_PYTHON. Resolves the checkout from its own location, so it can be

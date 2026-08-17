@@ -10,7 +10,7 @@ Providers (same code path, OpenAI-compatible /chat/completions). Built in:
 * mimo-v2.5 - opencode go       - https://opencode.ai/zen/go/v1  model mimo-v2.5       (opencode go, paid, 1M ctx)   DEFAULT
 * mimo-v2.5-free - opencode zen - https://opencode.ai/zen/v1     model mimo-v2.5-free  (opencode zen, free, 200k ctx)
 More can be added/removed and the default switched in the web UI
-(the daemon's web UI, http://127.0.0.1:8938) or by editing the store file
+(`server.py ui`, http://127.0.0.1:8938 while it runs) or by editing the store file
 ~/.config/mcp-qmedia/providers.json (0600, outside the repo - it may hold keys).
 
 API key per provider - never stored in this repo. Resolution order:
@@ -63,7 +63,7 @@ BUILTIN_PROVIDERS: dict[str, dict[str, str]] = {
 }
 BUILTIN_DEFAULT = "mimo-v2.5 - opencode go"
 STORE = Path(os.environ.get("QMEDIA_STORE", "~/.config/mcp-qmedia/providers.json")).expanduser()
-PORT = int(os.environ.get("QMEDIA_PORT", os.environ.get("QMEDIA_UI_PORT", "8938")))  # MCP SSE + web UI
+UI_PORT = int(os.environ.get("QMEDIA_UI_PORT", "8938"))  # `server.py ui` only (on demand, not a daemon)
 AUTH_JSON = Path(
     os.environ.get("QMEDIA_AUTH_JSON", "~/.local/share/opencode/auth.json")
 ).expanduser()
@@ -405,22 +405,22 @@ def backends() -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------- daemon: MCP over SSE + web UI, one port
-# web/page.html at the repo root - the layout every daemon repo shares; /api/status follows
-# ai-agent-setup/web/STATUS.md (the hub on :8930 polls it).
+# ---------------------------------------------------------------- web UI: on-demand setup wizard + probe
+# `server.py ui [port]` serves web/page.html (providers, keys, default, probe) while you need it and is
+# then closed - like mcp-imap's setup wizard. It is NOT a daemon: the MCP server is a plain stdio
+# process (run once, shared, by ai-agent-setup's mcp-bridge); it re-reads the store on every call.
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 _STARTED = time.time()
 _STATS = {"asks": 0, "errors": 0, "last_ask": 0.0, "running": 0}
 _STATS_LOCK = threading.Lock()
-_SSE_ACTIVE = 0  # connected MCP client sessions (see _SseCounter)
 
 
 def _unit_state() -> dict:
     out = {}
     for what in ("enabled", "active"):
         try:
-            r = subprocess.run(["systemctl", "--user", f"is-{what}", "mcp-qmedia.service"],
+            r = subprocess.run(["systemctl", "--user", f"is-{what}", "mcp-bridge.service"],
                                capture_output=True, text=True, timeout=5)
             out[what] = (r.stdout or r.stderr).strip() or "?"
         except Exception:  # noqa: BLE001
@@ -429,7 +429,7 @@ def _unit_state() -> dict:
 
 
 def _status() -> dict:
-    """STATUS.md shape: name / ok / busy / state / detail + store, jobs_running, mcp_sessions, service."""
+    """Same field set as the daemons' /api/status (ai-agent-setup/web/STATUS.md) - here for the wizard page only."""
     store = _load_store()
     default = store["default"]
     prov = store["providers"][default]
@@ -450,7 +450,7 @@ def _status() -> dict:
         "providers": _provider_rows(),
         "store": {"total": st["asks"], "newest": st["last_ask"] or None, "errors": st["errors"], "path": str(STORE)},
         "jobs_running": st["running"],
-        "mcp_sessions": _SSE_ACTIVE,
+        "mcp_sessions": None,  # served via mcp-bridge; not tracked here
         "ffmpeg": FFMPEG,
         "service": _unit_state(),
         "tools": [{"name": "ask"}, {"name": "describe"}, {"name": "backends"}],
@@ -460,8 +460,7 @@ def _status() -> dict:
 def _json_response(obj, code: int = 200):
     from starlette.responses import JSONResponse
 
-    # CORS * so the hub page (mcp-hub.service, :8930) can poll /api/status from the browser
-    return JSONResponse(obj, status_code=code, headers={"Access-Control-Allow-Origin": "*"})
+    return JSONResponse(obj, status_code=code)
 
 
 async def _read_json(request) -> dict:
@@ -592,43 +591,12 @@ async def _api_ask(request):
         return _json_response({"error": str(e)}, 400)
 
 
-class _SseCounter:
-    """ASGI middleware counting open /sse connections = connected MCP client sessions."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        global _SSE_ACTIVE
-        if scope.get("type") != "http" or scope.get("path") != "/sse":
-            return await self.app(scope, receive, send)
-        _SSE_ACTIVE += 1
-        gone = False
-
-        def _drop():
-            nonlocal gone
-            global _SSE_ACTIVE
-            if not gone:
-                gone = True
-                _SSE_ACTIVE -= 1
-
-        async def _receive():  # the SDK's SSE handler may linger after the client leaves - count the disconnect itself
-            msg = await receive()
-            if msg.get("type") == "http.disconnect":
-                _drop()
-            return msg
-
-        try:
-            await self.app(scope, _receive, send)
-        finally:
-            _drop()
-
-
 def _build_app():
     from starlette.routing import Route
 
-    app = mcp.sse_app()  # /sse + /messages/
-    app.router.routes.extend([
+    from starlette.applications import Starlette
+
+    return Starlette(routes=[
         Route("/", _page, methods=["GET"]),
         Route("/api/status", _api_status, methods=["GET"]),
         Route("/api/providers", _api_providers_get, methods=["GET"]),
@@ -637,25 +605,22 @@ def _build_app():
         Route("/api/default", _api_default, methods=["POST"]),
         Route("/api/ask", _api_ask, methods=["POST"]),
     ])
-    app.add_middleware(_SseCounter)
-    return app
 
 
-def serve(port: int) -> None:
+def ui(port: int) -> None:
     import uvicorn
 
-    _log(f"qmedia daemon: MCP SSE http://127.0.0.1:{port}/sse · web UI http://127.0.0.1:{port}/")
+    _log(f"qmedia setup wizard + probe: http://127.0.0.1:{port}/  (Ctrl-C to stop)")
     uvicorn.run(_build_app(), host="127.0.0.1", port=port, log_level="warning")
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "serve"
-    if mode == "stdio":  # stand-alone stdio MCP (no UI), e.g. for a client that cannot do SSE
-        mcp.run()
-    elif mode == "serve":
+    if len(sys.argv) > 1 and sys.argv[1] == "ui":
         try:
-            serve(int(sys.argv[2]) if len(sys.argv) > 2 else PORT)
+            ui(int(sys.argv[2]) if len(sys.argv) > 2 else UI_PORT)
         except KeyboardInterrupt:
             pass
+    elif len(sys.argv) > 1:
+        sys.exit("usage: server.py            # stdio MCP server\n       server.py ui [port]  # setup wizard + probe in the browser")
     else:
-        sys.exit(f"usage: server.py [serve [port] | stdio]  (default: serve on {PORT})")
+        mcp.run()
