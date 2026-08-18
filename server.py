@@ -31,6 +31,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -612,6 +613,27 @@ async def _api_ask(request):
         return _json_response({"error": str(e)}, 400)
 
 
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+def _is_loopback_host(value):
+    """True for a Host/Origin hostname naming this machine's loopback.
+
+    Source of truth is mcp-signal's signal_mcp/web.py; kept in step by hand until
+    the shared Python web module exists (see ai-agent-setup docs, P5-4).
+    """
+    if not value:
+        return False
+    v = str(value).strip().lower()
+    if v in _LOOPBACK_NAMES:
+        return True
+    if v.startswith("["):          # [::1]:PORT -> ::1
+        v = v[1:].split("]", 1)[0]
+    else:                          # 127.0.0.1:PORT -> 127.0.0.1
+        v = re.sub(r":\d+$", "", v)
+    return v in _LOOPBACK_NAMES
+
+
 class _OriginGuard:
     """The setup wizard is for the browser tab that opened it (same origin) —
     another web page must not be able to register a provider (attacker base URL)
@@ -622,6 +644,16 @@ class _OriginGuard:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            # DNS-rebinding guard, on every method: a rebound page sends a Host and an
+            # Origin that agree with each other and are both the attacker's, which is
+            # exactly what the same-origin test below compares. This runs for GET too,
+            # because the wizard's GETs disclose the configured providers.
+            if not _is_loopback_host(headers.get("host")):
+                await send({"type": "http.response.start", "status": 403, "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"error":"refused: loopback only"}'})
+                return
         if scope.get("type") == "http" and scope.get("method", "GET") not in ("GET", "HEAD"):
             headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
             origin = headers.get("origin")
