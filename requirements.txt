@@ -1,0 +1,13 @@
+# Runtime dependencies for this daemon's .venv (the systemd unit runs from it).
+#
+# The shared web layer: the loopback/DNS-rebinding guard, hub-origin CORS, the
+# same-origin write rule, the MCP-client counter and the cached systemd unit
+# lookup. Kept in one place because it is a security boundary — three daemons
+# each hand-maintaining it is how they drifted apart in the first place.
+#
+#   uv pip install -r requirements.txt
+#
+# For local development against a checkout of ai-agent-setup, install it editable
+# instead so edits are picked up without reinstalling:
+#   uv pip install -e ../mcp-web-core/python
+mcp-web-core @ git+ssh://git@github.com/spookysys/mcp-web-core@main#subdirectory=python

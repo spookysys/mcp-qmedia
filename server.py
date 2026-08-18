@@ -41,6 +41,11 @@ import time
 from pathlib import Path
 
 import httpx
+
+# The browser-facing rules live in one place for the whole fleet: mcp-web-core.
+# See requirements.txt. This wizard deliberately allows no cross-origin caller at
+# all (allowed=set()), unlike the chat daemons whose page is served by the hub.
+from mcp_web_core import HubCors, LoopbackOnly, unit_state
 from mcp.server.fastmcp import FastMCP
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -434,15 +439,8 @@ _STATS_LOCK = threading.Lock()
 
 
 def _unit_state() -> dict:
-    out = {}
-    for what in ("enabled", "active"):
-        try:
-            r = subprocess.run(["systemctl", "--user", f"is-{what}", "mcp-bridge.service"],
-                               capture_output=True, text=True, timeout=5)
-            out[what] = (r.stdout or r.stderr).strip() or "?"
-        except Exception:  # noqa: BLE001
-            out[what] = "?"
-    return out
+    """systemd state for the wizard's status card; cached in the shared layer."""
+    return unit_state("mcp-qmedia.service")
 
 
 def _status() -> dict:
@@ -613,71 +611,20 @@ async def _api_ask(request):
         return _json_response({"error": str(e)}, 400)
 
 
-_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
-
-
-def _is_loopback_host(value):
-    """True for a Host/Origin hostname naming this machine's loopback.
-
-    Source of truth is mcp-signal's signal_mcp/web.py; kept in step by hand until
-    the shared Python web module exists (see ai-agent-setup docs, P5-4).
-    """
-    if not value:
-        return False
-    v = str(value).strip().lower()
-    if v in _LOOPBACK_NAMES:
-        return True
-    if v.startswith("["):          # [::1]:PORT -> ::1
-        v = v[1:].split("]", 1)[0]
-    else:                          # 127.0.0.1:PORT -> 127.0.0.1
-        v = re.sub(r":\d+$", "", v)
-    return v in _LOOPBACK_NAMES
-
-
-class _OriginGuard:
-    """The setup wizard is for the browser tab that opened it (same origin) —
-    another web page must not be able to register a provider (attacker base URL)
-    and POST /api/ask to upload local files + a key there. Non-GET requests with a
-    foreign Origin → 403; no CORS."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http":
-            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
-            # DNS-rebinding guard, on every method: a rebound page sends a Host and an
-            # Origin that agree with each other and are both the attacker's, which is
-            # exactly what the same-origin test below compares. This runs for GET too,
-            # because the wizard's GETs disclose the configured providers.
-            if not _is_loopback_host(headers.get("host")):
-                await send({"type": "http.response.start", "status": 403, "headers": [(b"content-type", b"application/json")]})
-                await send({"type": "http.response.body", "body": b'{"error":"refused: loopback only"}'})
-                return
-        if scope.get("type") == "http" and scope.get("method", "GET") not in ("GET", "HEAD"):
-            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
-            origin = headers.get("origin")
-            if origin:
-                from urllib.parse import urlsplit
-
-                try:
-                    same = urlsplit(origin).netloc == headers.get("host", "")
-                except Exception:  # noqa: BLE001
-                    same = False
-                if not same:
-                    await send({"type": "http.response.start", "status": 403, "headers": [(b"content-type", b"application/json")]})
-                    await send({"type": "http.response.body", "body": b'{"error":"cross-origin write refused"}'})
-                    return
-        await self.app(scope, receive, send)
-
-
 def _build_app():
     from starlette.routing import Route
 
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
 
-    return Starlette(middleware=[Middleware(_OriginGuard)], routes=[
+    return Starlette(middleware=[
+        # outermost first here: Starlette applies this list in order.
+        Middleware(LoopbackOnly),
+        # No hub origin: the wizard's page is same-origin on this port, so any
+        # cross-origin caller is refused outright and no CORS header is ever set.
+        # The prefix is "/" because everything this daemon serves is the wizard.
+        Middleware(HubCors, allowed=set(), prefix="/"),
+    ], routes=[
         Route("/", _page, methods=["GET"]),
         Route("/api/status", _api_status, methods=["GET"]),
         Route("/api/providers", _api_providers_get, methods=["GET"]),
