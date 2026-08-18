@@ -1,2 +1,6 @@
 .venv/
 __pycache__/
+
+# Playwright MCP writes snapshots/screenshots into the cwd of whatever repo an
+# agent happens to be in; they are never ours to commit.
+.playwright-mcp/
