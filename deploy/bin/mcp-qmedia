@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Launch the qmedia MCP server over stdio (no args) - run once and shared by
-# ai-agent-setup's mcp-bridge, or per session by a client. `ui [port]` starts the
-# on-demand setup wizard + probe page (not a daemon).
+# ai-agent-setup's mcp-bridge, or per session by a client. `ui` says where the
+# settings moved (into the captioning service's page).
 #
 # Uses the venv inside the checkout by default; override the interpreter with
 # MCP_QMEDIA_PYTHON. Resolves the checkout from its own location, so it can be
 # symlinked anywhere (e.g. ln -s $PWD/deploy/bin/mcp-qmedia ~/.local/bin/).
 # Optional non-secret settings: ~/.config/mcp-qmedia/env (copy deploy/env.example)
-# or MCP_QMEDIA_ENV. The API key is NOT read here - the server takes it from
-# QMEDIA_API_KEY / OPENCODE_API_KEY or opencode's own auth.json (see README).
+# or MCP_QMEDIA_ENV. No API key is read anywhere in this process: the captioning
+# service on :8937 owns the models and their keys.
 set -euo pipefail
 repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
 settings="${MCP_QMEDIA_ENV:-$HOME/.config/mcp-qmedia/env}"
